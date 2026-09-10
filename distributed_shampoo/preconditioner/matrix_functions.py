@@ -177,6 +177,69 @@ def _matrix_perturbation(
     )
 
 
+_POWER_ITERATION_LAMBDA_MAX_SEED = 0
+
+
+@_check_square_matrix
+def power_iteration_lambda_max(
+    A: Tensor,
+    num_iterations: int = 8,
+) -> Tensor:
+    """Estimate the largest eigenvalue of a symmetric positive (semi-)definite matrix with power iteration.
+
+    Repeatedly applies A to a start vector, renormalizing to unit length, and returns the Rayleigh
+    quotient of the final iterate. For a symmetric positive (semi-)definite A, the Rayleigh quotient
+    lower-bounds the largest eigenvalue and approaches it geometrically at a rate of
+    (lambda_2 / lambda_1) ** (2 * num_iterations), so a few matvec steps already give a tight estimate
+    whenever the top of the spectrum is separated, as is typical for Shampoo preconditioner factors
+    (which are low-rank early in training).
+
+    Unlike the infinity norm, which upper-bounds the largest eigenvalue and can be loose by up to a
+    factor of the matrix dimension, this estimate is tight from below, which makes it a better scale
+    for iterative inverse-root solvers: scaling A by the reciprocal of a tight estimate puts the top
+    of the scaled spectrum near 1 instead of near lambda_max / trace(A), while remaining inside the
+    convergence basin of the coupled iteration (the estimate can exceed the largest eigenvalue only
+    by the quickly-vanishing power-iteration error).
+
+    This technique is used by the DASH optimizer (Modoranu et al., IST-DASLab, arXiv:2602.02016,
+    MIT-licensed) as the matrix scaler for its iterative inverse-root solvers; this is an
+    independent reimplementation in pure PyTorch under this repository's BSD license.
+
+    Args:
+        A (Tensor): Symmetric positive (semi-)definite matrix of interest.
+        num_iterations (int): Number of power-iteration refinement steps. (Default: 8)
+
+    Returns:
+        lambda_max_estimate (Tensor): 0-d tensor estimate of the largest eigenvalue of A, in A's dtype.
+
+    Raises:
+        ValueError: If the matrix is not 2-dimensional or not square, or if num_iterations is negative.
+
+    """
+    if num_iterations < 0:
+        raise ValueError(f"{num_iterations=} must be non-negative!")
+
+    # Use a fixed local seed: the estimate stays deterministic across optimizer steps (and
+    # reproducible across processes) without reading or writing the global RNG state, which would
+    # break the reproducibility of the optimizer step and is not thread-safe. A random start vector
+    # is still preferred over a fixed one (e.g. ones) because a fixed vector can have little or no
+    # overlap with the dominant eigenspace, from which power iteration recovers only slowly (or not
+    # at all, if the overlap is exactly zero).
+    generator = torch.Generator(device=A.device).manual_seed(
+        _POWER_ITERATION_LAMBDA_MAX_SEED
+    )
+    v = torch.randn(A.shape[0], generator=generator, dtype=A.dtype, device=A.device)
+    v = v / torch.linalg.vector_norm(v)
+    w = torch.matmul(A, v)
+    for _ in range(num_iterations):
+        v = w / torch.linalg.vector_norm(w)
+        w = torch.matmul(A, v)
+    # With ||v||_2 = 1, the Rayleigh quotient v^T A v is simply v^T w. Accumulate the dot product
+    # in float32 (and cast back) so low-precision inputs such as bf16 still yield a usable scale.
+    # The estimate is kept as an on-device 0-d tensor to avoid a host-device synchronization.
+    return torch.dot(v.to(torch.float32), w.to(torch.float32)).to(dtype=A.dtype)
+
+
 def matrix_inverse_root_from_eigendecomposition(
     L: Tensor,
     Q: Tensor,
@@ -568,6 +631,7 @@ def matrix_inverse_root(  # noqa: C901
         tolerance: float = 1e-20,
         order: int = 3,  # 2 represents Newton's method
         disable_tf32: bool = True,
+        lambda_max_power_iterations: int = 0,
     ) -> tuple[Tensor, Tensor, NewtonConvergenceFlag, int, Tensor]:
         """Compute matrix inverse root using coupled iterations, similar to above but generalized to support higher order.
 
@@ -597,6 +661,13 @@ def matrix_inverse_root(  # noqa: C901
             tolerance (float): Tolerance for determining exit criterion from iterations. (Default: 1e-20, which in practice guarantees they run to convergence)
             order (int): Order of the method. Order must be >= 2.  Higher order methods accelerate convergence (fewer iterations), but can take more matmuls per iteration. (Default: 3)
             disable_tf32 (bool): Whether to disable tf32 matmuls or not internally. Highly recommend keeping True, since tf32 is challenging numerically here. (Default: True)
+            lambda_max_power_iterations (int): When positive, estimate the largest eigenvalue of the ridged matrix with
+                power iteration and scale the iteration by its reciprocal instead of the reciprocal of the matrix trace.
+                This places the top of the scaled spectrum near 1 (rather than near lambda_max / trace, which can be far
+                below 1), typically reducing the number of iterations. The ridge (rel_epsilon, abs_epsilon) continues to
+                be computed from the infinity-norm bound, so only the iteration scale changes. See
+                power_iteration_lambda_max for details and references. (Default: 0, which preserves the existing
+                trace-based scaling)
 
         Returns:
             A_root (Tensor): Inverse root of matrix (A^{-1/root}).
@@ -673,7 +744,20 @@ def matrix_inverse_root(  # noqa: C901
             # Keep z as a 0-d tensor — `.item()` would force a host-device sync per
             # higher-order Newton call. Use `torch.pow` / `torch.reciprocal` for
             # tensor-native math (pyre rejects `Tensor ** float` and `float / Tensor`).
-            z = torch.reciprocal(torch.trace(A_ridge))
+            if lambda_max_power_iterations > 0:
+                # Optionally tighten the scale: the trace upper-bounds the largest eigenvalue
+                # (which it sums along with all the others), so scaling by its reciprocal can
+                # leave the top of the scaled spectrum M = z * A_ridge far below 1 and cost
+                # extra iterations. A power-iteration estimate of the largest eigenvalue is
+                # instead tight from below (Rayleigh quotients lower-bound it), which moves the
+                # top of the scaled spectrum near 1 while remaining inside the convergence basin.
+                # The ridge above is unaffected: it still uses the infinity-norm bound.
+                lambda_max_approx = power_iteration_lambda_max(
+                    A_ridge, num_iterations=lambda_max_power_iterations
+                )
+                z = torch.reciprocal(lambda_max_approx)
+            else:
+                z = torch.reciprocal(torch.trace(A_ridge))
             X = torch.pow(z, -s) * identity
             M = z * A_ridge
             error = torch.linalg.vector_norm(M - identity, torch.inf)
