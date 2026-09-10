@@ -313,6 +313,13 @@ class CoupledHigherOrderConfig(RootInvConfig):
             but can take more matmuls per iteration. order=2 represents Newton's method. (Default: 3)
         disable_tf32 (bool): Whether to disable tf32 matmuls or not internally. Highly recommend keeping True,
             since tf32 is challenging numerically here. (Default: True)
+        lambda_max_power_iterations (int): Number of power-iteration steps used to estimate the largest eigenvalue for
+            scaling the iteration. When 0 (the default), the matrix is scaled by the reciprocal of its trace, as before.
+            When positive, the matrix is instead scaled by the reciprocal of a tight power-iteration estimate of its
+            largest eigenvalue, which places the top of the scaled spectrum near 1 (rather than near
+            lambda_max / trace, which can be far below 1) and typically reduces the number of iterations. The ridge
+            (rel_epsilon / abs_epsilon) continues to be computed from the infinity-norm bound, so this only affects
+            the iteration scale. See power_iteration_lambda_max for details and references. (Default: 0)
 
     """
 
@@ -322,6 +329,14 @@ class CoupledHigherOrderConfig(RootInvConfig):
     tolerance: float = 1e-8
     order: int = 3
     disable_tf32: bool = True
+    lambda_max_power_iterations: int = 0
+
+    def __post_init__(self) -> None:
+        if self.lambda_max_power_iterations < 0:
+            raise ValueError(
+                f"Invalid lambda_max_power_iterations value: {self.lambda_max_power_iterations}. "
+                "Must be non-negative."
+            )
 
 
 @dataclass(init=False)

@@ -29,6 +29,7 @@ from distributed_shampoo.preconditioner.matrix_functions import (
     matrix_inverse_root_from_eigendecomposition,
     matrix_orthogonalization,
     NewtonConvergenceFlag,
+    power_iteration_lambda_max,
 )
 from distributed_shampoo.preconditioner.matrix_functions_types import (
     CoupledHigherOrderConfig,
@@ -385,6 +386,127 @@ class MatrixInverseRootTest(unittest.TestCase):
             A=A,
             root=root,
             root_inv_config=NotSupportedRootInvConfig(),
+        )
+
+
+@instantiate_parametrized_tests
+class PowerIterationLambdaMaxTest(unittest.TestCase):
+    @staticmethod
+    def _random_spd_matrix(n: int, dtype: torch.dtype, seed: int = 0) -> Tensor:
+        """Random symmetric positive definite matrix (a Wishart/Gram matrix)."""
+        generator = torch.Generator().manual_seed(seed)
+        G = torch.randn((n, n), generator=generator, dtype=dtype)
+        return G @ G.T
+
+    @parametrize("dtype", (torch.float32, torch.float64))
+    @parametrize("n", (2, 10, 64))
+    def test_power_iteration_lambda_max_matches_eigvalsh(
+        self, n: int, dtype: torch.dtype
+    ) -> None:
+        A = self._random_spd_matrix(n=n, dtype=dtype)
+        # The worst-case relative error of the Rayleigh quotient is bounded by
+        # (1 - r) * r ** (2 * num_iterations) with r = lambda_2 / lambda_1, whose maximum
+        # over all spectra is below 1% at 32 iterations, so any Wishart matrix passes.
+        lambda_max_estimate = power_iteration_lambda_max(A, num_iterations=32)
+        lambda_max = torch.linalg.eigvalsh(A).max()
+        torch.testing.assert_close(lambda_max_estimate, lambda_max, rtol=1e-2, atol=0.0)
+
+    def test_power_iteration_lambda_max_is_tighter_than_infinity_norm(self) -> None:
+        A = self._random_spd_matrix(n=64, dtype=torch.float32)
+        lambda_max_estimate = power_iteration_lambda_max(A, num_iterations=32)
+        # The Rayleigh quotient lower-bounds the largest eigenvalue, which in turn is
+        # upper-bounded by the infinity norm; allow a small relative slack for
+        # floating point rounding in the estimate.
+        infinity_norm = torch.linalg.matrix_norm(A, torch.inf)
+        self.assertLessEqual(
+            lambda_max_estimate.item(), infinity_norm.item() * (1.0 + 1e-3)
+        )
+
+    def test_power_iteration_lambda_max_is_deterministic(self) -> None:
+        # The fixed internal seed must make repeated calls agree exactly, i.e. the
+        # estimate must not depend on the global RNG state.
+        A = self._random_spd_matrix(n=16, dtype=torch.float32, seed=1234)
+        rng_state = torch.get_rng_state()
+        first = power_iteration_lambda_max(A, num_iterations=8)
+        torch.manual_seed(9876)  # perturb the global RNG between the two calls
+        second = power_iteration_lambda_max(A, num_iterations=8)
+        torch.set_rng_state(rng_state)
+        torch.testing.assert_close(first, second)
+
+    def test_power_iteration_lambda_max_supports_bf16(self) -> None:
+        A = self._random_spd_matrix(n=32, dtype=torch.bfloat16)
+        lambda_max_estimate = power_iteration_lambda_max(A, num_iterations=16)
+        lambda_max = torch.linalg.eigvalsh(A.to(torch.float32)).max()
+        # The iteration runs in bf16 (as DASH does on tensor cores), so only the dot
+        # product is accumulated in float32; a loose tolerance reflects bf16 rounding.
+        torch.testing.assert_close(
+            lambda_max_estimate.to(torch.float32), lambda_max, rtol=0.1, atol=0.0
+        )
+
+    def test_power_iteration_lambda_max_invalid_num_iterations(self) -> None:
+        A = torch.eye(2)
+        self.assertRaisesRegex(
+            ValueError,
+            re.escape("num_iterations=-1 must be non-negative!"),
+            power_iteration_lambda_max,
+            A,
+            num_iterations=-1,
+        )
+
+    def test_negative_lambda_max_power_iterations_raises(self) -> None:
+        self.assertRaisesRegex(
+            ValueError,
+            re.escape("Must be non-negative."),
+            CoupledHigherOrderConfig,
+            rel_epsilon=0.0,
+            abs_epsilon=0.0,
+            lambda_max_power_iterations=-1,
+        )
+
+
+@instantiate_parametrized_tests
+class MatrixInverseRootHigherOrderPowerIterationScalingTest(unittest.TestCase):
+    @parametrize("lambda_max_power_iterations", (0, 2, 8))
+    @parametrize(
+        "A, expected_root",
+        (
+            # A diagonal matrix.
+            (
+                torch.tensor([[1.0, 0.0], [0.0, 4.0]]),
+                torch.tensor([[1.0, 0.0], [0.0, 0.5]]),
+            ),
+            # Non-diagonal matrix.
+            (
+                torch.tensor(
+                    [
+                        [1195.0, -944.0, -224.0],
+                        [-944.0, 746.0, 177.0],
+                        [-224.0, 177.0, 42.0],
+                    ]
+                ),
+                torch.tensor([[1.0, 1.0, 1.0], [1.0, 2.0, -3.0], [1.0, -3.0, 18.0]]),
+            ),
+        ),
+    )
+    def test_matrix_inverse_root_with_power_iteration_lambda_max_scaling(
+        self, A: Tensor, expected_root: Tensor, lambda_max_power_iterations: int
+    ) -> None:
+        # Mirrors MatrixInverseRootTest.test_matrix_inverse_root: the opt-in
+        # power-iteration scale must produce the same inverse root as the default
+        # trace-based scale (0), just starting from a tighter scale.
+        torch.testing.assert_close(
+            expected_root,
+            matrix_inverse_root(
+                A=A,
+                root=Fraction(2),
+                root_inv_config=CoupledHigherOrderConfig(
+                    rel_epsilon=0.0,
+                    abs_epsilon=0.0,
+                    lambda_max_power_iterations=lambda_max_power_iterations,
+                ),
+            ),
+            atol=0.05,
+            rtol=1e-2,
         )
 
 
